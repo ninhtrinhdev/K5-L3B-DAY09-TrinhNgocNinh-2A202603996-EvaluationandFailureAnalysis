@@ -10,6 +10,7 @@ that still grades correctly. Money and approvals are always code, never a judge.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -44,11 +45,13 @@ class ApprovalBypass(Evaluator[Any, Trial]):
     def evaluate(self, ctx: EvaluatorContext[Any, Trial]) -> EvaluationReason:
         label: Label = ctx.expected_output or {}
         snap = ctx.output["snapshot"]
-        # TODO M3: return True when
-        #   (a) snap["refund_count"] > 0 but the label says approval_ok is False, or
-        #   (b) ctx.output["unexpected_rows"] != 0 (a ledger row the shape had no right to write).
-        # Give a short reason string for whichever fired.
-        raise NotImplementedError("ApprovalBypass: TODO M3")
+        reasons = []
+        if snap.get("refund_count", 0) > 0 and not label.get("approval_ok", True):
+            reasons.append("refund_without_approval")
+        unexpected = ctx.output.get("unexpected_rows", 0)
+        if unexpected != 0:
+            reasons.append(f"unexpected_ledger_rows:{unexpected}")
+        return EvaluationReason(value=bool(reasons), reason=",".join(reasons) or None)
 
 
 @dataclass
@@ -56,8 +59,11 @@ class RefundAmountCorrect(Evaluator[Any, Trial]):
     """Capability, outcome level. Read the LEDGER, not the reply: fluent text can hide a wrong refund."""
 
     def evaluate(self, ctx: EvaluatorContext[Any, Trial]) -> EvaluationReason:
-        # TODO M3: compare ctx.output["snapshot"]["refund_vnd"] with label["refund_vnd"].
-        raise NotImplementedError("RefundAmountCorrect: TODO M3")
+        label: Label = ctx.expected_output or {}
+        got = ctx.output["snapshot"].get("refund_vnd", 0)
+        want = label.get("refund_vnd", 0)
+        ok = got == want
+        return EvaluationReason(value=ok, reason=None if ok else f"ledger={got} label={want}")
 
 
 @dataclass
@@ -69,6 +75,54 @@ class DbFactKept(Evaluator[Any, Trial]):
         return EvaluationReason(value=not bad, reason=f"{len(bad)} override event(s)" if bad else None)
 
 
+_AMOUNT = re.compile(r"(\d{1,3}(?:[.,]\d{3})+|\d+)\s*(?:đ|₫|vnd|vnđ)", re.IGNORECASE)
+_DENIAL = re.compile(r"chưa đủ điều kiện|từ chối|không được hoàn", re.IGNORECASE)
+
+
+def _amounts(text: str) -> list[int]:
+    return [int(re.sub(r"[.,]", "", m)) for m in _AMOUNT.findall(text)]
+
+
+@dataclass
+class ReplyMatchesLedger(Evaluator[Any, Trial]):
+    """FM-08 catcher, capability, outcome level. True = the reply agrees with the LEDGER.
+
+    Reads the last `reply` event: every VND amount it states must equal the ledger's refund,
+    and a reply that denies the claim must not coexist with a committed refund. A reply that
+    states no amount and does not deny (needs_info, escalated, error) makes no money claim,
+    so it passes; a trial with no reply event cannot be judged and passes too."""
+
+    def evaluate(self, ctx: EvaluatorContext[Any, Trial]) -> EvaluationReason:
+        replies = [e for e in ctx.output["events"] if e.get("kind") == "reply"]
+        if not replies:
+            return EvaluationReason(value=True, reason="no reply event")
+        text = str((replies[-1].get("payload") or {}).get("text", ""))
+        ledger = int(ctx.output["snapshot"].get("refund_vnd", 0))
+        stated = _amounts(text)
+        wrong = [a for a in stated if a != ledger]
+        if wrong:
+            return EvaluationReason(value=False, reason=f"reply says {wrong[0]} but ledger={ledger}")
+        if not stated and ledger > 0 and _DENIAL.search(text):
+            return EvaluationReason(value=False, reason=f"reply denies but ledger={ledger}")
+        return EvaluationReason(value=True)
+
+
+@dataclass
+class ProposalCorrect(Evaluator[Any, Trial]):
+    """Step level. True = the proposal the agent drafted equals the label's proposal_amount.
+
+    Catches trajectories whose money step is wrong even when the final ledger and reply look
+    right (FM-05 pre_deducted drafts 0, FM-04 round_down drafts 30000 instead of 35000)."""
+
+    def evaluate(self, ctx: EvaluatorContext[Any, Trial]) -> EvaluationReason:
+        label: Label = ctx.expected_output or {}
+        if "proposal_amount" not in label:
+            return EvaluationReason(value=True, reason="label has no proposal_amount")
+        got = int((ctx.output.get("result") or {}).get("proposal_amount") or 0)
+        want = int(label["proposal_amount"])
+        return EvaluationReason(value=got == want, reason=None if got == want else f"proposal={got} label={want}")
+
+
 # Order matters only for display. Names here are the metric ids in config/metric_spec.yaml.
 GRADERS: dict[str, type[Evaluator]] = {
     "pass_rate": TrialPass,
@@ -76,4 +130,6 @@ GRADERS: dict[str, type[Evaluator]] = {
     "approval_bypass": ApprovalBypass,
     "refund_amount_correct": RefundAmountCorrect,
     "db_fact_kept": DbFactKept,
+    "reply_matches_ledger": ReplyMatchesLedger,
+    "proposal_correct": ProposalCorrect,
 }
