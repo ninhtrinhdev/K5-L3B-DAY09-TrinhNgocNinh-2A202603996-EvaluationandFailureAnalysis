@@ -1,0 +1,2 @@
+# Eval data is hashed (eval_set_sha): keep LF on every OS so local and CI hashes match.
+src/data/eval/* text eol=lf
